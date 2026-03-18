@@ -13,7 +13,7 @@ HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
-    "Prefer": "resolution=merge-duplicates"  # evita duplicati
+    "Prefer": "resolution=merge-duplicates"
 }
 
 DATA_URL = "https://dati.anticorruzione.it/opendata/download/dataset/cig-2025/filesystem/cig_json_2025_01.zip"
@@ -29,21 +29,32 @@ def parse_date(date_str):
 
 def clean_record(record):
     ocid = record.get("cig")
-
     if not ocid:
         return None
 
+    # IMPORTO CORRETTO
+    amount = record.get("importo_complessivo_gara") or record.get("importo_lotto") or 0
+
     try:
-        amount = float(record.get("importo", 0))
+        amount = float(amount)
     except:
         return None
 
+    # FILTRO IMPORTO
     if amount < 50000:
         return None
 
+    # SOLO BANDI ATTIVI
+    if record.get("stato") != "ATTIVO":
+        return None
+
+    # (OPZIONALE BUSINESS) solo lavori
+    # if record.get("oggetto_principale_contratto") != "LAVORI":
+    #     return None
+
     return {
         "ocid": ocid,
-        "title": record.get("oggetto"),
+        "title": record.get("oggetto_gara") or record.get("oggetto_lotto"),
         "amount": amount,
         "published_date": parse_date(record.get("data_pubblicazione")),
         "raw": record
@@ -52,7 +63,7 @@ def clean_record(record):
 # ---------- DOWNLOAD + EXTRACT ----------
 async def download_and_extract():
     async with httpx.AsyncClient() as client:
-        r = await client.get(DATA_URL, timeout=60)
+        r = await client.get(DATA_URL, timeout=120)
 
         print("DOWNLOAD STATUS:", r.status_code)
 
@@ -82,7 +93,7 @@ async def fetch():
     records = []
 
     with open(json_path, "r", encoding="utf-8") as f:
-        for i, line in enumerate(f):
+        for line in f:
             try:
                 record = json.loads(line.strip())
                 records.append(record)
@@ -91,7 +102,7 @@ async def fetch():
 
     print("Totale record:", len(records))
 
-    return records[:200]  # test (poi togli limite)
+    return records[:300]  # TEST (poi togli limite)
 
 # ---------- INSERT ----------
 async def insert(data):
@@ -130,7 +141,6 @@ async def main():
 
     await insert(cleaned)
     print(f"Inseriti {len(cleaned)} record")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
