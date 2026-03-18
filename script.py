@@ -49,7 +49,7 @@ def clean_release(release):
 # --------- FETCH SICURO ---------
 
 async def fetch():
-    url = "https://dati.anticorruzione.it/opendata/ocds/release-package.json"
+    url = "https://www.anticorruzione.it/opencms/export/ocds/release-package-20260318.json"
 
     async with httpx.AsyncClient() as client:
         try:
