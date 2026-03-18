@@ -1,6 +1,8 @@
 import asyncio
 import httpx
 import os
+import json
+import zipfile
 from datetime import datetime
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -12,8 +14,9 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
-# --------- UTILS ---------
+DATA_URL = "https://dati.anticorruzione.it/opendata/download/dataset/cig-2025/filesystem/cig_json_2025_01.zip"
 
+# ---------- UTILS ----------
 def parse_date(date_str):
     if not date_str:
         return None
@@ -22,68 +25,67 @@ def parse_date(date_str):
     except:
         return None
 
+def clean_record(record):
+    ocid = record.get("cig")
 
-def clean_release(release):
-    ocid = release.get("ocid")
     if not ocid:
         return None
 
-    tender = release.get("tender", {})
-
-    if tender.get("status") != "active":
+    try:
+        amount = float(record.get("importo", 0))
+    except:
         return None
 
-    amount = tender.get("value", {}).get("amount", 0)
-    if not amount or amount < 50000:
+    if amount < 50000:
         return None
 
     return {
         "ocid": ocid,
-        "title": tender.get("title"),
+        "title": record.get("oggetto"),
         "amount": amount,
-        "published_date": parse_date(release.get("date")),
-        "raw": release
+        "published_date": parse_date(record.get("data_pubblicazione")),
+        "raw": record
     }
 
-
-# --------- FETCH SICURO ---------
-
-async def fetch():
-    url = "https://www.anticorruzione.it/opencms/export/ocds/release-package-20260318.json"
-
+# ---------- DOWNLOAD + EXTRACT ----------
+async def download_and_extract():
     async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get(url, timeout=60)
-            print("STATUS:", r.status_code)
+        r = await client.get(DATA_URL, timeout=60)
 
-            if r.status_code != 200:
-                print("Errore API:", r.status_code)
-                return {}
+        print("DOWNLOAD STATUS:", r.status_code)
 
-            # Controllo se la risposta è vuota
-            if not r.text.strip():
-                print("Risposta vuota")
-                return {}
+        if r.status_code != 200:
+            return None
 
-            try:
-                data = r.json()
-            except Exception as e:
-                print("JSONDecodeError:", e)
-                print("Prima parte del testo:", r.text[:500])
-                return {}
+        with open("data.zip", "wb") as f:
+            f.write(r.content)
 
-            # Per test: prendi solo prime 10 releases
-            releases = data.get("releases", [])[:10]
-            print("DEBUG releases:", len(releases))
-            return {"releases": releases}
+    with zipfile.ZipFile("data.zip", "r") as zip_ref:
+        zip_ref.extractall("data")
 
-        except Exception as e:
-            print("Errore fetch:", str(e))
-            return {}
+    # trova il JSON dentro lo zip
+    for file in os.listdir("data"):
+        if file.endswith(".json"):
+            return f"data/{file}"
 
+    return None
 
-# --------- INSERT ---------
+# ---------- FETCH ----------
+async def fetch():
+    json_path = await download_and_extract()
 
+    if not json_path:
+        print("Errore download o unzip")
+        return []
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    print("Totale record:", len(data))
+
+    return data[:100]  # test
+
+# ---------- INSERT ----------
 async def insert(data):
     async with httpx.AsyncClient() as client:
         r = await client.post(
@@ -95,33 +97,26 @@ async def insert(data):
         print("INSERT STATUS:", r.status_code)
 
         if r.status_code >= 300:
-            print("Errore inserimento:", r.text)
+            print("Errore:", r.text)
 
-
-# --------- MAIN ---------
-
+# ---------- MAIN ----------
 async def main():
-    data = await fetch()
-
-    if not data:
-        print("Nessun dato ricevuto")
-        return
-
-    releases = data.get("releases", [])
+    records = await fetch()
 
     cleaned = []
-    for r in releases:
-        c = clean_release(r)
+    for r in records:
+        c = clean_record(r)
         if c:
             cleaned.append(c)
 
+    print("Dopo filtro:", len(cleaned))
+
     if not cleaned:
-        print("Nessun dato valido dopo filtro")
+        print("Nessun dato valido")
         return
 
     await insert(cleaned)
     print(f"Inseriti {len(cleaned)} record")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
