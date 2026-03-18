@@ -12,6 +12,8 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
+# --------- UTILS ---------
+
 def parse_date(date_str):
     if not date_str:
         return None
@@ -19,6 +21,7 @@ def parse_date(date_str):
         return datetime.fromisoformat(date_str.replace("Z", "+00:00")).isoformat()
     except:
         return None
+
 
 def clean_release(release):
     ocid = release.get("ocid")
@@ -31,7 +34,7 @@ def clean_release(release):
         return None
 
     amount = tender.get("value", {}).get("amount", 0)
-    if amount < 50000:
+    if not amount or amount < 50000:
         return None
 
     return {
@@ -42,22 +45,63 @@ def clean_release(release):
         "raw": release
     }
 
+
+# --------- FETCH SICURO ---------
+
 async def fetch():
     url = "https://api.anticorruzione.it/opendata/release/tender/12345"
+
     async with httpx.AsyncClient() as client:
-        r = await client.get(url)
-        return r.json()
+        try:
+            r = await client.get(url, timeout=10)
+
+            print("STATUS:", r.status_code)
+
+            if r.status_code != 200:
+                print("Errore API")
+                return {}
+
+            if not r.text.strip():
+                print("Risposta vuota")
+                return {}
+
+            try:
+                return r.json()
+            except Exception:
+                print("Non è JSON valido")
+                print("RISPOSTA:", r.text[:200])
+                return {}
+
+        except Exception as e:
+            print("Errore fetch:", str(e))
+            return {}
+
+
+# --------- INSERT ---------
 
 async def insert(data):
     async with httpx.AsyncClient() as client:
-        await client.post(
+        r = await client.post(
             f"{SUPABASE_URL}/rest/v1/tenders",
             headers=HEADERS,
             json=data
         )
 
+        print("INSERT STATUS:", r.status_code)
+
+        if r.status_code >= 300:
+            print("Errore inserimento:", r.text)
+
+
+# --------- MAIN ---------
+
 async def main():
     data = await fetch()
+
+    if not data:
+        print("Nessun dato ricevuto")
+        return
+
     releases = data.get("releases", [])
 
     cleaned = []
@@ -66,8 +110,13 @@ async def main():
         if c:
             cleaned.append(c)
 
-    if cleaned:
-        await insert(cleaned)
-        print("Dati inseriti")
+    if not cleaned:
+        print("Nessun dato valido dopo filtro")
+        return
 
-asyncio.run(main())
+    await insert(cleaned)
+    print(f"Inseriti {len(cleaned)} record")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
