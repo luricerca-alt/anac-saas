@@ -53,17 +53,28 @@ async def fetch():
 
     async with httpx.AsyncClient() as client:
         try:
-            r = await client.get(url, timeout=30)
+            r = await client.get(url, timeout=60)
             print("STATUS:", r.status_code)
 
             if r.status_code != 200:
-                print("Errore API")
+                print("Errore API:", r.status_code)
                 return {}
 
-            data = r.json()
-            # per test iniziale prendiamo solo prime 100 releases
-            releases = data.get("releases", [])[:100]
+            # Controllo se la risposta è vuota
+            if not r.text.strip():
+                print("Risposta vuota")
+                return {}
 
+            try:
+                data = r.json()
+            except Exception as e:
+                print("JSONDecodeError:", e)
+                print("Prima parte del testo:", r.text[:500])
+                return {}
+
+            # Per test: prendi solo prime 10 releases
+            releases = data.get("releases", [])[:10]
+            print("DEBUG releases:", len(releases))
             return {"releases": releases}
 
         except Exception as e:
