@@ -49,28 +49,23 @@ def clean_release(release):
 # --------- FETCH SICURO ---------
 
 async def fetch():
-    url = "https://api.anticorruzione.it/opendata/release/tender/12345"
+    url = "https://dati.anticorruzione.it/opendata/ocds/release-package.json"
 
     async with httpx.AsyncClient() as client:
         try:
-            r = await client.get(url, timeout=10)
+            r = await client.get(url, timeout=30)
 
             print("STATUS:", r.status_code)
 
             if r.status_code != 200:
-                print("Errore API")
                 return {}
 
-            if not r.text.strip():
-                print("Risposta vuota")
-                return {}
+            data = r.json()
 
-            try:
-                return r.json()
-            except Exception:
-                print("Non è JSON valido")
-                print("RISPOSTA:", r.text[:200])
-                return {}
+            # prendi solo prime 100 per test
+            releases = data.get("releases", [])[:100]
+
+            return {"releases": releases}
 
         except Exception as e:
             print("Errore fetch:", str(e))
