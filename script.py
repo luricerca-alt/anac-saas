@@ -54,15 +54,14 @@ async def fetch():
     async with httpx.AsyncClient() as client:
         try:
             r = await client.get(url, timeout=30)
-
             print("STATUS:", r.status_code)
 
             if r.status_code != 200:
+                print("Errore API")
                 return {}
 
             data = r.json()
-
-            # prendi solo prime 100 per test
+            # per test iniziale prendiamo solo prime 100 releases
             releases = data.get("releases", [])[:100]
 
             return {"releases": releases}
