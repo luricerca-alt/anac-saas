@@ -1,205 +1,131 @@
 import asyncio
 import httpx
 import os
-import json
 import zipfile
+import io
+import json
 from datetime import datetime
 
-# ---------- CONFIG ----------
+# ---------------- CONFIG ----------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # usare service key per insert
 HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
-    "Content-Type": "application/json",
-    "Prefer": "resolution=merge-duplicates"
+    "Content-Type": "application/json"
 }
 
-# ---------- DATASET ----------
+# URL dei dataset delta o mese corrente
+DATASETS = {
+    "cig_delta": "https://dati.anticorruzione.it/opendata/download/dataset/CIG%20aggiornamenti%20delta/filesystem/CIG_aggiornamenti_delta_json.zip",
+    "subappalti": "https://dati.anticorruzione.it/opendata/download/dataset/subappalti/filesystem/subappalti_json.zip"
+}
 
-# CIG mensili (2025 come esempio)
-MONTHS = ["01", "02", "03"]
+BATCH_SIZE = 50  # batch insert supabase
+IMPORTO_MINIMO = 50000
 
-# altri dataset singoli
-DATASETS = [
-    "cig-2025",
-    "subappalti",
-    "aggiudicazioni",
-    "pubblicazioni"
-]
+# ---------------- UTILS ----------------
 
-BASE_URL = "https://dati.anticorruzione.it/opendata/download/dataset"
-
-# ---------- UTILS ----------
 def parse_date(date_str):
+    """Pulisce e normalizza le date"""
     if not date_str:
         return None
     try:
-        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-    except:
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00")).isoformat()
+    except Exception:
         return None
 
-def is_open(record):
-    scadenza = record.get("data_scadenza_offerta")
-    if not scadenza:
-        return False
-    try:
-        return datetime.fromisoformat(scadenza) >= datetime.now()
-    except:
-        return False
-
-def clean_cig(record):
-    ocid = record.get("cig")
+def clean_record(record):
+    """Filtra record validi e normalize"""
+    # ogni dataset può avere chiave diversa, uniformiamo con ocid
+    ocid = record.get("cig") or record.get("ocid")
     if not ocid:
         return None
 
-    amount = record.get("importo_complessivo_gara") or record.get("importo_lotto") or 0
-    try:
-        amount = float(amount)
-    except:
+    # stato attivo
+    stato = record.get("stato") or record.get("esito")
+    if stato and stato.lower() not in ["attivo", "aggiudicata"]:
         return None
 
-    if amount < 50000:
-        return None
-    if not is_open(record):
-        return None
-    # filtro opzionale solo lavori
-    if record.get("oggetto_principale_contratto") != "LAVORI":
+    # importo
+    importo = record.get("importo_lotto") or record.get("importo_complessivo_gara") or 0
+    try:
+        importo = float(importo)
+    except:
+        importo = 0
+    if importo < IMPORTO_MINIMO:
         return None
 
     return {
         "ocid": ocid,
         "title": record.get("oggetto_gara") or record.get("oggetto_lotto"),
-        "amount": amount,
-        "published_date": parse_date(record.get("data_pubblicazione")).isoformat() if parse_date(record.get("data_pubblicazione")) else None,
+        "amount": importo,
+        "published_date": parse_date(record.get("data_pubblicazione")),
         "raw": record
     }
 
-# Per gli altri dataset puoi aggiungere altre funzioni di cleaning
-def clean_generic(record):
-    ocid = record.get("cig") or record.get("id")
-    if not ocid:
-        return None
-    return {
-        "ocid": ocid,
-        "title": record.get("oggetto_gara") or record.get("oggetto_lotto") or record.get("denominazione_amministrazione_appaltante"),
-        "amount": record.get("importo_complessivo_gara") or record.get("importo_lotto") or 0,
-        "published_date": parse_date(record.get("data_pubblicazione")).isoformat() if parse_date(record.get("data_pubblicazione")) else None,
-        "raw": record
-    }
+# ---------------- FETCH & PARSE ----------------
 
-# ---------- URL BUILDER ----------
-def build_url(dataset, month=None):
-    if dataset == "cig-2025":
-        return f"{BASE_URL}/{dataset}/filesystem/cig_json_2025_{month}.zip"
-    else:
-        return f"{BASE_URL}/{dataset}/filesystem/{dataset}_json.zip"
-
-# ---------- DOWNLOAD ----------
-async def download_zip(url, filename):
-    async with httpx.AsyncClient() as client:
-        r = await client.get(url, timeout=120)
-        print("DOWNLOAD:", url, "STATUS:", r.status_code)
+async def fetch_dataset(name, url):
+    """Scarica e processa dataset ZIP in streaming"""
+    print(f"Scaricando dataset {name} da {url}")
+    async with httpx.AsyncClient(timeout=600) as client:
+        r = await client.get(url)
         if r.status_code != 200:
-            return None
-        with open(filename, "wb") as f:
-            f.write(r.content)
-    return filename
+            print(f"Errore download {name}: {r.status_code}")
+            return []
 
-# ---------- EXTRACT ----------
-def extract_zip(zip_path):
-    folder = zip_path.replace(".zip", "")
-    os.makedirs(folder, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "r") as zip_ref:
-        zip_ref.extractall(folder)
-    for file in os.listdir(folder):
-        if file.endswith(".json"):
-            return os.path.join(folder, file)
-    return None
+        print(f"DOWNLOAD STATUS: {r.status_code}")
+        data_list = []
 
-# ---------- FETCH MULTI DATASET ----------
-async def fetch_all():
-    all_records = []
-
-    for dataset in DATASETS:
-
-        if dataset == "cig-2025":
-            for month in MONTHS:
-                url = build_url(dataset, month)
-                zip_file = f"{dataset}_{month}.zip"
-                downloaded = await download_zip(url, zip_file)
-                if not downloaded:
+        # Apri ZIP in memoria
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+            for filename in z.namelist():
+                if not filename.endswith(".json"):
                     continue
-                json_path = extract_zip(downloaded)
-                if not json_path:
-                    continue
-                with open(json_path, "r", encoding="utf-8") as f:
+                with z.open(filename) as f:
                     for line in f:
                         try:
-                            record = json.loads(line.strip())
-                            record["_dataset"] = dataset
-                            all_records.append(record)
-                        except:
-                            continue
-        else:
-            url = build_url(dataset)
-            zip_file = f"{dataset}.zip"
-            downloaded = await download_zip(url, zip_file)
-            if not downloaded:
-                continue
-            json_path = extract_zip(downloaded)
-            if not json_path:
-                continue
-            with open(json_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    try:
-                        record = json.loads(line.strip())
-                        record["_dataset"] = dataset
-                        all_records.append(record)
-                    except:
-                        continue
+                            record = json.loads(line)
+                            cleaned = clean_record(record)
+                            if cleaned:
+                                data_list.append(cleaned)
+                        except Exception as e:
+                            print(f"Errore parsing record: {e}")
+        print(f"Totale record validi da {name}: {len(data_list)}")
+        return data_list
 
-    print("TOTALE RECORD GREZZI:", len(all_records))
-    return all_records
+# ---------------- INSERT ----------------
 
-# ---------- INSERT ----------
-async def insert(data):
-    async with httpx.AsyncClient() as client:
-        r = await client.post(
-            f"{SUPABASE_URL}/rest/v1/tenders?on_conflict=ocid",
-            headers=HEADERS,
-            json=data
-        )
-        print("INSERT STATUS:", r.status_code)
-        if r.status_code >= 300:
-            print("Errore:", r.text)
-
-# ---------- MAIN ----------
-async def main():
-    records = await fetch_all()
-    cleaned = []
-
-    for r in records:
-        if r["_dataset"] == "cig-2025":
-            c = clean_cig(r)
-        else:
-            c = clean_generic(r)
-        if c:
-            cleaned.append(c)
-
-    print("DOPO FILTRO (UTILI):", len(cleaned))
-    if not cleaned:
-        print("Nessun bando utile trovato")
+async def insert_supabase(records):
+    """Inserisce batch di record in Supabase"""
+    if not records:
+        print("Nessun record da inserire")
         return
 
-    # batch insert
-    batch_size = 100
-    for i in range(0, len(cleaned), batch_size):
-        batch = cleaned[i:i+batch_size]
-        await insert(batch)
+    async with httpx.AsyncClient() as client:
+        for i in range(0, len(records), BATCH_SIZE):
+            batch = records[i:i+BATCH_SIZE]
+            r = await client.post(
+                f"{SUPABASE_URL}/rest/v1/tenders",
+                headers=HEADERS,
+                json=batch
+            )
+            if r.status_code >= 300:
+                print(f"Errore inserimento batch: {r.status_code} {r.text}")
+            else:
+                print(f"Batch inserito ({len(batch)} record)")
 
-    print(f"Totale inseriti: {len(cleaned)}")
+# ---------------- MAIN ----------------
+
+async def main():
+    all_records = []
+    for name, url in DATASETS.items():
+        records = await fetch_dataset(name, url)
+        all_records.extend(records)
+
+    print(f"Totale record dopo tutti i dataset: {len(all_records)}")
+    await insert_supabase(all_records)
 
 if __name__ == "__main__":
     asyncio.run(main())
